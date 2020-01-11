@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.ComponentModel.DataAnnotations;
+using System.Globalization;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -11,13 +13,245 @@ namespace Chapter4
     {
         internal static void Main(string[] args)
         {
-	        UsingBarrierClass();
-
+	        UsingCustomScheduler();
+			
 			Console.WriteLine("Press enter to finish.");
 			Console.ReadLine();
 		}
 
-		private static void UsingBarrierClass()
+		private static void UsingCustomScheduler()
+		{
+			int procCount = System.Environment.ProcessorCount;
+			var scheduler = new CustomScheduler(procCount);
+
+			Console.WriteLine($"Custom shceduler Id: {scheduler.Id}");
+			Console.WriteLine($"Default scheduler Id: {TaskScheduler.Default.Id}");
+
+			var tokenSource = new CancellationTokenSource();
+
+			var task1 = new Task(() =>
+			{
+				Console.WriteLine($"task1 {Task.CurrentId} executed by scheduler {TaskScheduler.Current.Id}");
+
+				Task.Factory.StartNew(() =>
+				{
+					Console.WriteLine($"task1-1 {Task.CurrentId} executed by scheduler {TaskScheduler.Current.Id}");
+				});
+
+				Task.Factory.StartNew(() =>
+				{
+					Console.WriteLine($"task1-2 {Task.CurrentId} executed by scheduler {TaskScheduler.Current.Id}");
+				}, tokenSource.Token, TaskCreationOptions.None, TaskScheduler.Default);
+			});
+
+			task1.Start(scheduler);
+
+			task1.ContinueWith(antecedent =>
+			{
+				Console.WriteLine($"task3 {Task.CurrentId} executed by scheduler {TaskScheduler.Current.Id}");
+			});
+
+			task1.ContinueWith(antecedent =>
+			{
+				Console.WriteLine($"task4 {Task.CurrentId} executed by scheduler {TaskScheduler.Current.Id}");
+			}, scheduler);
+		}
+
+		#region Producer/Consumer Pattern
+
+		private static void UsingMultipleBlockingCollectionInstances()
+		{
+			var bc1 = new BlockingCollection<string>();
+			var bc2 = new BlockingCollection<string>();
+			var bc3 = new BlockingCollection<string>();
+
+			var bc1And2 = new [] { bc1, bc2 };
+			var bcAll = new [] { bc1, bc2, bc3 };
+
+			var tokenSource = new CancellationTokenSource();
+
+			for (int i = 0; i < 5; i++)
+			{
+				Task.Factory.StartNew(() =>
+				{
+					while (!tokenSource.IsCancellationRequested)
+					{
+						var message = string.Format($"Message from task {Task.CurrentId}");
+						
+						BlockingCollection<string>.AddToAny(bc1And2, message, tokenSource.Token);
+						tokenSource.Token.WaitHandle.WaitOne(1000);
+					}
+				}, tokenSource.Token);
+			}
+
+			for (int j = 0; j < 3; j++)
+			{
+				Task.Factory.StartNew(() =>
+				{
+					while (!tokenSource.IsCancellationRequested)
+					{
+						int bcId =
+							BlockingCollection<string>
+								.TakeFromAny(bcAll, out var item, tokenSource.Token);
+
+						Console.WriteLine($"From collection {bcId}: {item}");
+					}
+				}, tokenSource.Token);
+			}
+
+			Console.WriteLine("Press enter to cancel tasks...");
+			Console.ReadLine();
+			tokenSource.Cancel();
+		}
+
+		private static void ProducerConsumerPatter()
+		{
+			var blockingCollection = new BlockingCollection<Deposit>();
+
+			var producers = new Task[3];
+			for (int i = 0; i < producers.Length; i++)
+			{
+				producers[i] = Task.Factory.StartNew(() =>
+				{
+					for (int j = 0; j < 20; j++)
+					{
+						var deposit = new Deposit() { Amount = 100 };
+						blockingCollection.Add(deposit);
+					}
+				});
+			}
+
+			Task.Factory.ContinueWhenAll(producers, antecedents =>
+			{
+				Console.WriteLine("Signalling production end.");
+				blockingCollection.CompleteAdding();
+			});
+
+			var bankAccount = new BankAccount();
+			var consumer = Task.Factory.StartNew(() =>
+			{
+				while (!blockingCollection.IsCompleted)
+				{
+					if (blockingCollection.TryTake(out var deposit))
+						bankAccount.Balance += deposit.Amount;
+				}
+
+				Console.WriteLine($"Final balance: {bankAccount.Balance}");
+			});
+
+			consumer.Wait();
+		}
+
+		#endregion
+
+		#region Primitives
+
+		private static void UseSemaphoreSlim()
+		{
+			var semaphore = new SemaphoreSlim(2);
+			var tokenSource = new CancellationTokenSource();
+
+			for (int i = 0; i < 10; i++)
+			{
+				Task.Factory.StartNew(() =>
+				{
+					while (true)
+					{
+						semaphore.Wait(tokenSource.Token);
+						Console.WriteLine($"Task {Task.CurrentId} released.");
+					}
+				}, tokenSource.Token);
+			}
+
+			var signallingTask = Task.Factory.StartNew(() =>
+			{
+				while (!tokenSource.Token.IsCancellationRequested)
+				{
+					tokenSource.Token.WaitHandle.WaitOne(500);
+					semaphore.Release(2);
+
+					Console.WriteLine("Semaphore released.");
+				}
+			}, tokenSource.Token);
+
+			Console.WriteLine("Press enter to cancel tasks");
+			Console.ReadLine();
+			tokenSource.Cancel();
+		}
+
+		private static void UsingManualResetEventSlim()
+		{
+			var manualResetEvent = new ManualResetEventSlim();
+			var tokenSource = new CancellationTokenSource();
+
+			var waitingTask = Task.Factory.StartNew(() =>
+			{
+				while (true)
+				{
+					manualResetEvent.Wait(tokenSource.Token);
+					Console.WriteLine("Waiting task is active.");
+				}
+			}, tokenSource.Token);
+
+			var signalingTask = Task.Factory.StartNew(() =>
+			{
+				var random = new Random();
+				while (!tokenSource.Token.IsCancellationRequested)
+				{
+					tokenSource.Token.WaitHandle.WaitOne(random.Next(500, 1000));
+					manualResetEvent.Set();
+					Console.WriteLine("Event set");
+					tokenSource.Token.WaitHandle.WaitOne(random.Next(500, 1000));
+					manualResetEvent.Reset();
+					Console.WriteLine("Event reset!");
+				}
+
+				tokenSource.Token.ThrowIfCancellationRequested();
+			}, tokenSource.Token);
+
+			Console.WriteLine("Press enter to cancel tasks");
+			Console.ReadLine();
+
+			tokenSource.Cancel();
+
+			try
+			{
+				Task.WaitAll(waitingTask, signalingTask);
+			}
+			catch(AggregateException)
+			{ }
+		}
+
+        private static void UsingCountDownEventPrimitive()
+		{
+			var cdEvent = new CountdownEvent(5);
+			var random = new Random();
+			var tasks = new Task[6];
+
+			for (int i = 0; i < tasks.Length - 1; i++)
+			{
+				tasks[i] = new Task(() =>
+				{
+					Thread.Sleep(random.Next(1000, 3000));
+					cdEvent.Signal();
+					Console.WriteLine($"Task {Task.CurrentId} signaling event.");
+				});
+			}
+
+			tasks[5] = new Task(() =>
+			{
+				Console.WriteLine("Rendezvous task waiting...");
+				cdEvent.Wait();
+				Console.WriteLine("Event has been set");
+			});
+
+			foreach(var task in tasks)
+				task.Start();
+
+			Task.WaitAll(tasks);
+		}
+
+		private static void UsingBarrierPrimitive()
 		{
 			var accounts = new BankAccount[5];
 			for (int i = 0; i < accounts.Length; i++)
@@ -61,7 +295,9 @@ namespace Chapter4
 			Task.WaitAll(tasks);
 		}
 
-        #region Child tasks
+		#endregion
+
+		#region Child tasks
 
         private static void SimpleChildTask()
 		{
