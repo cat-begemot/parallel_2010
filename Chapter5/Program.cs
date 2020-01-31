@@ -1,19 +1,209 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Threading.Tasks;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Threading;
 
 namespace Chapter5
 {
-    internal class Program
+	internal class Program
     {
         public static void Main(string[] args)
         {
-	        UsingBreakInParallelLoop();
+	        UsingOrderablePartitioner();
 
 	        Console.WriteLine("Press enter to finish...");
 	        Console.ReadLine();
         }
+
+		#region Custom Partioning Strategy
+
+		private static void UsingContextPartitionerClass()
+		{
+//			var random = new Random();
+//			var sourceData = new WorkItem[10_000];
+//
+//			for (int i = 0; i < sourceData.Length; i++)
+//			{
+//				sourceData[i] = new WorkItem() {WorkDuration = random.Next(1, 11)};
+//			}
+//
+//			Partitioner<WorkItem> cPartitioner = new ContextPartitioner(sourceData, 100);
+//
+//			Parallel.ForEach(cPartitioner, item => { item.PerformWork(); });
+		}
+		#endregion
+
+		private static void UsingOrderablePartitioner()
+        {
+	        IList<string> sourceData = new List<string>()
+	        {
+		        "an", "apple", "a", "day", "keeps", "the", "doctor", "away"
+	        };
+			string[] resultData = new string[sourceData.Count];
+
+			OrderablePartitioner<string> op = Partitioner.Create(sourceData);
+
+			Parallel.ForEach(op, (string item, ParallelLoopState loopState, long index) =>
+			{
+				if (item == "apple")
+					item = "apricot";
+				resultData[index] = item;
+			});
+
+			for (int i = 0; i < resultData.Length; i++)
+			{
+				Console.WriteLine($"Item {i}: {resultData[i]}.");
+			}
+        }
+
+        private static void UsingChunkingPartioner()
+        {
+	        double[] resultData = new double[10_000_000];
+	        OrderablePartitioner<Tuple<int, int>> chunkPart = Partitioner.Create(0, resultData.Length, 10_000);
+
+	        Parallel.ForEach(chunkPart, chunkRange =>
+	        {
+		        for (int i = chunkRange.Item1; i < chunkRange.Item2; i++)
+		        {
+			        resultData[i] = Math.Pow(i, 2);
+		        }
+	        });
+        }
+
+		delegate void ProcessValue(int value);
+		static double[] resultData = new double[10_000_000];
+
+		private static void ComputeResultValue(int indexValue) =>
+			resultData[indexValue] = Math.Pow(indexValue, 2);
+
+		private static void ParallelLoopWithVerySmallBody()
+        {
+			Parallel.For(9, resultData.Length, (int index) =>
+			{
+				resultData[index] = Math.Pow(index, 2);
+			});
+
+			Parallel.For(0, resultData.Length, delegate(int index)
+			{
+				resultData[index] = Math.Pow((double)index, 2);
+			});
+
+			var pDel = new ProcessValue(ComputeResultValue);
+			var pAction = new Action<int>(pDel);
+			Parallel.For(0, resultData.Length, pAction);
+        }
+
+		private static void MixingSynchronousAndParallelLoop()
+		{
+			var rnd = new Random();
+			int itemsPerMonth = 100_000;
+			var sourceData = new Transaction[12 * itemsPerMonth];
+
+			for (int i = 0; i < 12 * itemsPerMonth; i++)
+			{
+				sourceData[i] = new Transaction() {Amount = rnd.Next(-450, 500)};
+			}
+
+			var monthlyBalance = new int[12];
+
+			for (int currentMonth = 0; currentMonth < 12; currentMonth++)
+			{
+				Parallel.For(currentMonth * itemsPerMonth, (currentMonth + 1) * itemsPerMonth, new ParallelOptions(),
+					() => 0, (index, loopState, tlsBalance) =>
+					{
+						return tlsBalance += sourceData[index].Amount;
+					},
+					tlsBalance => monthlyBalance[currentMonth] += tlsBalance);
+
+				if (currentMonth > 0)
+					monthlyBalance[currentMonth] += monthlyBalance[currentMonth - 1];
+			}
+
+			for (int i = 0; i < monthlyBalance.Length; i++)
+			{
+				Console.WriteLine($"Month {i} - Balance: {monthlyBalance[i]}");
+			}
+		}
+
+        private static void ParallelForEachLoopWithTLS()
+        {
+	        int matchedWords = 0;
+	        var lockObject = new object();
+	        var dataItems = new string[]
+	        {
+		        "an", "apple", "a", "day", "keeps", "the", "doctor", "away"
+	        };
+
+	        Parallel.ForEach(dataItems, () => 0, (string item, ParallelLoopState loopState, int tlsValue) =>
+	        {
+		        foreach(var ch in item)
+					if (ch == 'a')
+						tlsValue++;
+		        return tlsValue;
+	        }, tlsValue =>
+	        {
+		        lock (lockObject)
+			        matchedWords += tlsValue;
+	        });
+
+	        Console.WriteLine($"Matches 'a': {matchedWords}");
+        }
+
+        private static void ParallelLoopWithTLS()
+        {
+	        int total = 0;
+
+	        Parallel.For(0, 100, () => 0, (int index, ParallelLoopState loopState, int tlsValue) =>
+	        {
+		        tlsValue += 1;
+		        return tlsValue;
+	        }, value => Interlocked.Add(ref total, value));
+
+	        Console.WriteLine($"Total: {total}");
+        }
+
+        private static void CancellingParallelLoop()
+        {
+			var tokenSource = new CancellationTokenSource();
+
+			Task.Factory.StartNew(() =>
+			{
+				Thread.Sleep(2000);
+				tokenSource.Cancel();
+
+				Console.WriteLine("Token cancelled.");
+			});
+
+			ParallelOptions loopOptions = new ParallelOptions() {CancellationToken = tokenSource.Token};
+			try
+			{
+				Parallel.For(0, Int64.MaxValue, loopOptions, index =>
+				{
+					double result = Math.Pow(index, 3);
+					Console.WriteLine($"Index {index}, result {result}");
+					Thread.Sleep(500);
+				});
+			}
+			catch (OperationCanceledException)
+			{
+				Console.WriteLine("Caught cancellation exception...");
+			}
+        }
+
+		private static void UsingParallelLoopResultStructure()
+		{
+			ParallelLoopResult loopResult = Parallel.For(0, 10, (int index, ParallelLoopState loopState) =>
+			{
+				if (index == 2)
+					loopState.Stop();
+			});
+
+			Console.WriteLine("Loop Result:");
+			Console.WriteLine($"Is completed: {loopResult.IsCompleted}");
+			Console.WriteLine($"Break value: {loopResult.LowestBreakIteration.HasValue}");
+		}
 
         private static void UsingBreakInParallelLoop()
         {
