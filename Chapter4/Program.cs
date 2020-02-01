@@ -28,7 +28,7 @@ namespace Chapter4
 			Console.WriteLine($"Default scheduler Id: {TaskScheduler.Default.Id}");
 
 			var tokenSource = new CancellationTokenSource();
-
+			
 			var task1 = new Task(() =>
 			{
 				Console.WriteLine($"task1 {Task.CurrentId} executed by scheduler {TaskScheduler.Current.Id}");
